@@ -31,6 +31,7 @@ cargo fmt --all -- --check
 cargo clippy -p xml5ever --all-targets --all-features -- -D warnings
 cargo nextest run -p xml5ever --no-fail-fast
 cargo test -p xml5ever --doc
+cargo nextest run -p markup5ever_rcdom --test xml-cdata --no-fail-fast
 ```
 
 The XML regression tests use a DOM sink implementing `XmlTreeSink`; they cover

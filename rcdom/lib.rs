@@ -428,17 +428,18 @@ impl TreeSink for RcDom {
     fn append(&self, parent: &Handle, child: NodeOrText<Handle>) {
         // The reference DOM flattens XML CDATA to text. Such nodes arrive as
         // AppendNode, but still need the usual adjacent-text coalescing.
-        let child = match child {
-            NodeOrText::AppendNode(ref node) => match &node.data {
-                NodeData::Text { contents } => NodeOrText::AppendText(contents.borrow().clone()),
-                _ => child,
+        let text = match &child {
+            NodeOrText::AppendText(text) => Some(Cow::Borrowed(text)),
+            NodeOrText::AppendNode(node) => match &node.data {
+                NodeData::Text { contents } => Some(Cow::Owned(contents.borrow().clone())),
+                _ => None,
             },
-            _ => child,
         };
-        // Append to an existing Text node if we have one.
-        if let NodeOrText::AppendText(text) = &child {
+        // Append to an existing Text node if we have one, otherwise retain
+        // the supplied node's identity when appending it below.
+        if let Some(text) = text {
             if let Some(h) = parent.children.borrow().last() {
-                if append_to_existing_text(h, text) {
+                if append_to_existing_text(h, &text) {
                     return;
                 }
             }
