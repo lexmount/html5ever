@@ -21,7 +21,7 @@ use crate::macros::time;
 use crate::tendril::StrTendril;
 use crate::{buffer_queue, Attribute, QualName, SmallCharSet};
 use log::debug;
-use markup5ever::{local_name, namespace_prefix, ns, small_char_set, TokenizerResult};
+use markup5ever::{ns, small_char_set, TokenizerResult};
 use std::borrow::Cow::{self, Borrowed};
 use std::cell::{Cell, RefCell, RefMut};
 use std::cmp::Reverse;
@@ -150,6 +150,9 @@ pub struct XmlTokenizer<Sink> {
     /// Current comment.
     current_comment: RefCell<StrTendril>,
 
+    /// Current CDATA section.
+    current_cdata: RefCell<StrTendril>,
+
     /// Current processing instruction target.
     current_pi_target: RefCell<StrTendril>,
 
@@ -189,6 +192,7 @@ impl<Sink: TokenSink> XmlTokenizer<Sink> {
             current_attr_name: RefCell::new(StrTendril::new()),
             current_attr_value: RefCell::new(StrTendril::new()),
             current_comment: RefCell::new(StrTendril::new()),
+            current_cdata: RefCell::new(StrTendril::new()),
             current_pi_data: RefCell::new(StrTendril::new()),
             current_pi_target: RefCell::new(StrTendril::new()),
             current_doctype: RefCell::new(Doctype::default()),
@@ -484,6 +488,19 @@ impl<Sink: TokenSink> XmlTokenizer<Sink> {
         self.process_token(Token::Comment(comment));
     }
 
+    fn emit_current_cdata(&self) -> ProcessResult<<Sink as TokenSink>::Handle> {
+        let cdata = self.current_cdata.take();
+        self.process_token(Token::Cdata(cdata))
+    }
+
+    fn emit_incomplete_cdata_as_characters(&self, trailing_brackets: usize) {
+        let mut cdata = self.current_cdata.take();
+        for _ in 0..trailing_brackets {
+            cdata.push_char(']');
+        }
+        self.process_token(Token::Characters(cdata));
+    }
+
     fn emit_current_doctype(&self) {
         let doctype = self.current_doctype.take();
         self.process_token(Token::Doctype(doctype));
@@ -541,6 +558,9 @@ macro_rules! shorthand (
     ( $me:ident : append_comment $c:expr           ) => ( $me.current_comment.borrow_mut().push_slice($c)     );
     ( $me:ident : emit_comment                     ) => ( $me.emit_current_comment()                          );
     ( $me:ident : clear_comment                    ) => ( $me.current_comment.borrow_mut().clear()            );
+    ( $me:ident : push_cdata $c:expr               ) => ( $me.current_cdata.borrow_mut().push_char($c)        );
+    ( $me:ident : clear_cdata                      ) => ( $me.current_cdata.borrow_mut().clear()               );
+    ( $me:ident : emit_incomplete_cdata $n:expr    ) => ( $me.emit_incomplete_cdata_as_characters($n)        );
     ( $me:ident : create_doctype                   ) => ( *$me.current_doctype.borrow_mut() = Doctype::default() );
     ( $me:ident : push_doctype_name $c:expr        ) => ( option_push(&mut $me.current_doctype.borrow_mut().name, $c) );
     ( $me:ident : push_doctype_id $k:ident $c:expr ) => ( option_push(&mut $me.doctype_id($k), $c)            );
@@ -607,6 +627,11 @@ macro_rules! go (
     ( $me:ident : emit_pi $s:ident ) => ({
         $me.state.set(XmlState::$s);
         return $me.emit_pi();
+    });
+
+    ( $me:ident : emit_cdata $s:ident ) => ({
+        $me.state.set(XmlState::$s);
+        return $me.emit_current_cdata();
     });
 
     ( $me:ident : eof ) => ({ $me.emit_eof(); return ProcessResult::Done; });
@@ -754,7 +779,7 @@ impl<Sink: TokenSink> XmlTokenizer<Sink> {
                 if eat!(self, input, "--") {
                     go!(self: clear_comment; to XmlState::CommentStart);
                 } else if eat!(self, input, "[CDATA[") {
-                    go!(self: to XmlState::Cdata);
+                    go!(self: clear_cdata; to XmlState::Cdata);
                 } else if eat!(self, input, "DOCTYPE") {
                     go!(self: to XmlState::Doctype);
                 } else {
@@ -850,22 +875,24 @@ impl<Sink: TokenSink> XmlTokenizer<Sink> {
             XmlState::Cdata => loop {
                 match get_char!(self, input) {
                     ']' => go!(self: to XmlState::CdataBracket),
-                    cl => go!(self: emit cl),
+                    cl => go!(self: push_cdata cl),
                 }
             },
             //§ cdata-bracket-state
             XmlState::CdataBracket => loop {
                 match get_char!(self, input) {
                     ']' => go!(self: to XmlState::CdataEnd),
-                    cl => go!(self: emit ']'; emit cl; to XmlState::Cdata),
+                    cl => go!(self: push_cdata ']'; push_cdata cl; to XmlState::Cdata),
                 }
             },
             //§ cdata-end-state
             XmlState::CdataEnd => loop {
                 match get_char!(self, input) {
-                    '>' => go!(self: to XmlState::Data),
-                    ']' => go!(self: emit ']'),
-                    cl => go!(self: emit ']'; emit ']'; emit cl; to XmlState::Cdata),
+                    '>' => go!(self: emit_cdata Data),
+                    ']' => go!(self: push_cdata ']'),
+                    cl => {
+                        go!(self: push_cdata ']'; push_cdata ']'; push_cdata cl; to XmlState::Cdata)
+                    },
                 }
             },
             //§ tag-name-state
@@ -1195,9 +1222,11 @@ impl<Sink: TokenSink> XmlTokenizer<Sink> {
             XmlState::TagState => go!(self: error_eof; emit '<'; to XmlState::Data),
             XmlState::EndTagState => go!(self: error_eof; emit '<'; emit '/'; to XmlState::Data),
             XmlState::TagEmpty => go!(self: error_eof; to XmlState::TagAttrNameBefore),
-            XmlState::Cdata | XmlState::CdataBracket | XmlState::CdataEnd => {
-                go!(self: error_eof; to XmlState::Data)
+            XmlState::Cdata => go!(self: error_eof; emit_incomplete_cdata 0; to XmlState::Data),
+            XmlState::CdataBracket => {
+                go!(self: error_eof; emit_incomplete_cdata 1; to XmlState::Data)
             },
+            XmlState::CdataEnd => go!(self: error_eof; emit_incomplete_cdata 2; to XmlState::Data),
             XmlState::Pi => go!(self: error_eof; to XmlState::BogusComment),
             XmlState::PiTargetAfter => go!(self: reconsume XmlState::PiData),
             // The '?' we consumed to get here never became a '?>', so keep it.
@@ -1303,13 +1332,10 @@ impl<Sink: TokenSink> XmlTokenizer<Sink> {
                 value: replace(&mut self.current_attr_value.borrow_mut(), StrTendril::new()),
             };
 
-            if qname.local == local_name!("xmlns")
-                || qname.prefix == Some(namespace_prefix!("xmlns"))
-            {
-                self.current_tag_attrs.borrow_mut().insert(0, attr);
-            } else {
-                self.current_tag_attrs.borrow_mut().push(attr);
-            }
+            // Keep source order. The tree builder performs a declaration-only
+            // pass before binding any qualified names, so declarations do not
+            // need to be moved ahead of ordinary attributes here.
+            self.current_tag_attrs.borrow_mut().push(attr);
         }
     }
 

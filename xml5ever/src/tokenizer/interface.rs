@@ -95,6 +95,8 @@ pub enum Token {
     Comment(StrTendril),
     /// Token that represents a series of characters.
     Characters(StrTendril),
+    /// Token that represents a CDATA section.
+    Cdata(StrTendril),
     /// End of File found.
     EndOfFile,
     /// NullCharacter encountered.

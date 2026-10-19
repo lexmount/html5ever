@@ -29,6 +29,13 @@ use crate::{LocalName, Namespace, Prefix};
 
 use crate::tendril::{StrTendril, Tendril};
 
+/// XML-specific tree sink operations that are not part of markup5ever's
+/// HTML-oriented [`TreeSink`] interface.
+pub trait XmlTreeSink: TreeSink {
+    /// Create a CDATA section node.
+    fn create_cdata(&self, text: StrTendril) -> Self::Handle;
+}
+
 static XML_URI: &str = "http://www.w3.org/XML/1998/namespace";
 static XMLNS_URI: &str = "http://www.w3.org/2000/xmlns/";
 
@@ -192,7 +199,7 @@ pub struct XmlTreeBuilder<Handle, Sink> {
 impl<Handle, Sink> XmlTreeBuilder<Handle, Sink>
 where
     Handle: Clone,
-    Sink: TreeSink<Handle = Handle>,
+    Sink: XmlTreeSink<Handle = Handle>,
 {
     /// Create a new tree builder which sends tree modifications to a particular `TreeSink`.
     ///
@@ -250,9 +257,10 @@ where
     fn declare_ns(&self, attr: &mut Attribute) {
         if let Err(msg) = self.current_namespace.borrow_mut().insert_ns(attr) {
             self.sink.parse_error(msg);
-        } else {
-            attr.name.ns = ns!(xmlns);
         }
+        // Namespace declarations are real DOM attributes. Keep their XMLNS
+        // namespace identity even when the declaration itself is invalid.
+        attr.name.ns = ns!(xmlns);
     }
 
     fn find_uri(&self, prefix: &Option<Prefix>) -> Result<Option<Namespace>, Cow<'static, str>> {
@@ -335,12 +343,17 @@ where
             self.declare_ns(attr);
         }
 
-        // Then we bind those namespace declarations to attributes
-        for attr in tag.attrs.iter_mut().filter(|attr| {
-            attr.name.prefix != Some(namespace_prefix!("xmlns"))
-                && attr.name.local != local_name!("xmlns")
-        }) {
-            if self.bind_attr_qname(&mut present_attrs, &mut attr.name) {
+        // Bind ordinary attributes and retain namespace declarations in their
+        // original order. Tree sinks need the declarations as Attr nodes even
+        // though the namespace resolver has already consumed their values.
+        for attr in tag.attrs.iter_mut() {
+            let is_namespace_declaration = attr.name.ns == ns!(xmlns);
+            let keep = if is_namespace_declaration {
+                Self::check_duplicate_attr(&mut present_attrs, &attr.name)
+            } else {
+                self.bind_attr_qname(&mut present_attrs, &mut attr.name)
+            };
+            if keep {
                 new_attr.push(attr.clone());
             }
         }
@@ -399,7 +412,7 @@ where
 impl<Handle, Sink> TokenSink for XmlTreeBuilder<Handle, Sink>
 where
     Handle: Clone,
-    Sink: TreeSink<Handle = Handle>,
+    Sink: XmlTreeSink<Handle = Handle>,
 {
     type Handle = Handle;
 
@@ -418,13 +431,19 @@ where
             tokenizer::Token::NullCharacter => Token::NullCharacter,
             tokenizer::Token::EndOfFile => Token::Eof,
             tokenizer::Token::Characters(x) => Token::Characters(x),
+            tokenizer::Token::Cdata(x) => Token::Cdata(x),
         };
 
         self.process_to_completion(token)
     }
 
     fn end(&self) {
-        for node in self.open_elems.borrow_mut().drain(..).rev() {
+        let mut open_elems = self.open_elems.borrow_mut();
+        if !open_elems.is_empty() {
+            self.sink
+                .parse_error(Borrowed("Unexpected EOF with an unclosed XML element"));
+        }
+        for node in open_elems.drain(..).rev() {
             self.sink.pop(&node);
         }
     }
@@ -437,7 +456,7 @@ fn current_node<Handle>(open_elems: &[Handle]) -> &Handle {
 impl<Handle, Sink> XmlTreeBuilder<Handle, Sink>
 where
     Handle: Clone,
-    Sink: TreeSink<Handle = Handle>,
+    Sink: XmlTreeSink<Handle = Handle>,
 {
     fn current_node(&self) -> Ref<'_, Handle> {
         Ref::map(self.open_elems.borrow(), |elems| {
@@ -526,6 +545,12 @@ where
         XmlProcessResult::Done
     }
 
+    fn append_cdata(&self, text: StrTendril) -> XmlProcessResult<Handle> {
+        let cdata = self.sink.create_cdata(text);
+        self.insert_appropriately(AppendNode(cdata));
+        XmlProcessResult::Done
+    }
+
     fn tag_in_open_elems(&self, tag: &Tag) -> bool {
         self.open_elems
             .borrow()
@@ -605,7 +630,7 @@ fn any_not_whitespace(x: &StrTendril) -> bool {
 impl<Handle, Sink> XmlTreeBuilder<Handle, Sink>
 where
     Handle: Clone,
-    Sink: TreeSink<Handle = Handle>,
+    Sink: XmlTreeSink<Handle = Handle>,
 {
     fn step(&self, mode: XmlPhase, token: Token) -> XmlProcessResult<<Self as TokenSink>::Handle> {
         self.debug_step(mode, &token);
@@ -671,6 +696,7 @@ where
             },
             XmlPhase::Main => match token {
                 Token::Characters(chs) => self.append_text(chs),
+                Token::Cdata(text) => self.append_cdata(text),
                 Token::Tag(Tag {
                     kind: StartTag,
                     name,

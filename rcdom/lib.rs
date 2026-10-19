@@ -426,6 +426,15 @@ impl TreeSink for RcDom {
     }
 
     fn append(&self, parent: &Handle, child: NodeOrText<Handle>) {
+        // The reference DOM flattens XML CDATA to text. Such nodes arrive as
+        // AppendNode, but still need the usual adjacent-text coalescing.
+        let child = match child {
+            NodeOrText::AppendNode(ref node) => match &node.data {
+                NodeData::Text { contents } => NodeOrText::AppendText(contents.borrow().clone()),
+                _ => child,
+            },
+            _ => child,
+        };
         // Append to an existing Text node if we have one.
         if let NodeOrText::AppendText(text) = &child {
             if let Some(h) = parent.children.borrow().last() {
@@ -586,6 +595,16 @@ impl TreeSink for RcDom {
                 option.clone_an_option_into_selectedcontent(selectedcontent);
             }
         }
+    }
+}
+
+impl xml5ever::tree_builder::XmlTreeSink for RcDom {
+    fn create_cdata(&self, text: StrTendril) -> Handle {
+        // RcDom intentionally has no distinct CDATA node type. Browser DOM
+        // sinks implement this operation with their own CDATA node instead.
+        Node::new(NodeData::Text {
+            contents: RefCell::new(text),
+        })
     }
 }
 

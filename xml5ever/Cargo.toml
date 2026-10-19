@@ -19,7 +19,9 @@ trace_tokenizer = []
 serde = ["markup5ever/serde"]
 
 [dependencies]
-markup5ever = { workspace = true }
+# Keep the standalone XML fork compatible with consumers of registry markup5ever.
+# The workspace root patches this back to the local crate for development.
+markup5ever = "0.40"
 log = { workspace = true }
 
 [dev-dependencies]
